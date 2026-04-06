@@ -23,7 +23,7 @@ class LabelCodec:
 
 def run_test():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_path = "tamil_crnn.pth"
+    model_path = "tamil_crnn_v2.pth"
     
     if not Path(model_path).exists():
         print(f"Error: {model_path} not found.")

@@ -16,7 +16,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState(null);
   const [lastRunAt, setLastRunAt] = useState(null);
-  
+
   // State from the backend
   const [currentStep, setCurrentStep] = useState(0);
   const [annotatedUrl, setAnnotatedUrl] = useState(null);
@@ -38,7 +38,7 @@ function App() {
 
   const apiBase = import.meta.env.VITE_API_BASE ?? "";
 
-  const runOCR = async () => {
+  const runOCR = async (endpoint = "/ocr") => {
     if (!file) {
       setToast({
         tone: "warning",
@@ -60,7 +60,7 @@ function App() {
         setCurrentStep((prev) => (prev < 3 ? prev + 1 : prev));
       }, 800);
 
-      const res = await fetch(`${apiBase}/ocr`, {
+      const res = await fetch(`${apiBase}${endpoint}`, {
         method: "POST",
         body: formData,
       });
@@ -167,21 +167,21 @@ function App() {
     a.remove();
     URL.revokeObjectURL(url);
   };
-  
+
   const onDownloadPdf = async () => {
     if (!text) return;
-    
+
     try {
       const formData = new FormData();
       formData.append("text", text);
-      
+
       const res = await fetch(`${apiBase}/export/pdf`, {
         method: "POST",
         body: formData,
       });
-      
+
       if (!res.ok) throw new Error("Failed to generate PDF");
-      
+
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -206,7 +206,7 @@ function App() {
       </div>
 
       <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
-        
+
         {/* Header */}
         <header className="flex flex-col gap-4 border-b border-zinc-800/80 pb-6 mb-2">
           <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
@@ -220,19 +220,19 @@ function App() {
                 </h1>
               </div>
               <p className="mt-2 text-[15px] text-zinc-400 max-w-2xl">
-                Upload any Tamil document—printed or handwritten. Our <b>Hybrid AI Pipeline</b> 
-                automatically detects the document type and selects either Tesseract or 
+                Upload any Tamil document—printed or handwritten. Our <b>Hybrid AI Pipeline</b>
+                automatically detects the document type and selects either Tesseract or
                 a custom Deep Learning CRNN for the best accuracy.
               </p>
             </div>
-            
+
             <div className="flex items-center gap-3">
               <Button variant="ghost" onClick={onClear} disabled={loading && !file && !text && !annotatedUrl}>
                 Reset All
               </Button>
-              <Button 
-                variant="primary" 
-                onClick={runOCR} 
+              <Button
+                variant="primary"
+                onClick={() => runOCR("/ocr")}
                 disabled={loading || !file}
                 className="shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_25px_rgba(99,102,241,0.5)] bg-gradient-to-r from-indigo-600 to-indigo-500 border border-indigo-500"
               >
@@ -250,14 +250,34 @@ function App() {
                   </>
                 )}
               </Button>
+              <Button
+                variant="primary"
+                onClick={() => runOCR("/ocr/palmleaf")}
+                disabled={loading || !file}
+                className="shadow-[0_0_20px_rgba(234,179,8,0.3)] hover:shadow-[0_0_25px_rgba(234,179,8,0.5)] bg-gradient-to-r from-yellow-600 to-yellow-500 border border-yellow-500"
+              >
+                {loading ? (
+                  <>
+                    <Spinner className="border-yellow-200 border-t-transparent size-4" />
+                    Processing Pipeline…
+                  </>
+                ) : (
+                  <>
+                    <svg className="size-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                    Palm Leaf Mode
+                  </>
+                )}
+              </Button>
             </div>
           </div>
 
           {(loading || currentStep > 0) && (
             <div className="mt-4 py-3 px-4 rounded-xl bg-zinc-900/40 border border-zinc-800/60 backdrop-blur-sm">
-              <ProgressSteps 
-                steps={PIPELINE_STEPS} 
-                currentStep={currentStep} 
+              <ProgressSteps
+                steps={PIPELINE_STEPS}
+                currentStep={currentStep}
                 loading={loading}
               />
             </div>
@@ -265,7 +285,7 @@ function App() {
         </header>
 
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 min-h-[600px]">
-          
+
           {/* Left Column - Input */}
           <div className="lg:col-span-5 flex flex-col gap-6">
             <Card className="flex-1 flex flex-col shadow-xl shadow-black/20">
@@ -281,14 +301,14 @@ function App() {
                 </div>
               </CardHeader>
               <CardBody className="flex-1 flex flex-col pt-4">
-                
+
                 {annotatedUrl ? (
-                   <BoundingBoxViewer 
-                     imageUrl={previewUrl} 
-                     annotatedUrl={annotatedUrl}
-                     boxes={boxes}
-                     className="mb-4"
-                   />
+                  <BoundingBoxViewer
+                    imageUrl={previewUrl}
+                    annotatedUrl={annotatedUrl}
+                    boxes={boxes}
+                    className="mb-4"
+                  />
                 ) : (
                   <Dropzone
                     className="flex-1 flex flex-col mb-4"
@@ -324,7 +344,7 @@ function App() {
             {classification && Object.keys(classification).length > 0 && !classification.error && (
               <ConfidenceChart classification={classification} />
             )}
-            
+
           </div>
 
           {/* Right Column - Extracted Text */}
@@ -347,12 +367,12 @@ function App() {
                     )}
                   </div>
                   <CardDescription>
-                    {stats.word_count > 0 
+                    {stats.word_count > 0
                       ? `${stats.word_count} words · ${stats.char_count} characters detected`
                       : "Awaiting execution..."}
                   </CardDescription>
                 </div>
-                
+
                 <div className="flex flex-wrap items-center gap-2">
                   <Button variant="ghost" onClick={onCopy} disabled={!text} className="text-xs px-3">
                     Copy Text
@@ -366,11 +386,11 @@ function App() {
                   </Button>
                 </div>
               </CardHeader>
-              
+
               <CardBody className="flex-1 flex flex-col p-0">
                 <div className="relative flex-1 bg-[#1a1c23] m-4 rounded-xl border border-zinc-800/80 overflow-hidden shadow-inner">
                   {text ? (
-                    <textarea 
+                    <textarea
                       readOnly
                       value={text}
                       className="absolute inset-0 w-full h-full resize-none bg-transparent p-5 text-[15px] leading-relaxed text-zinc-100 font-sans focus:outline-none selection:bg-indigo-500/40"
@@ -387,7 +407,7 @@ function App() {
               </CardBody>
             </Card>
           </div>
-          
+
         </div>
 
       </div>

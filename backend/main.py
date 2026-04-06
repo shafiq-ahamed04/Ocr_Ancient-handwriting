@@ -20,11 +20,27 @@ import pytesseract
 import torch
 import torch.nn as nn
 from PIL import Image, ImageDraw, ImageFont
-from fastapi import FastAPI, File, Form, UploadFile
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fpdf import FPDF
 from torchvision import models, transforms
+
+# ---------------------------------------------------------------------------
+# Config & Env
+# ---------------------------------------------------------------------------
+# Use the .env file in the venv folder (as per current user location)
+ENV_PATH = Path(__file__).resolve().parent / "venv" / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+TESSERACT_PATH = os.getenv("TESSERACT_PATH")
+if TESSERACT_PATH:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS = ALLOWED_ORIGINS_STR.split(",") if ALLOWED_ORIGINS_STR != "*" else ["*"]
 
 # ---------------------------------------------------------------------------
 # App
@@ -37,7 +53,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS if "*" not in ALLOWED_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,7 +67,7 @@ MODEL_PATH = ML_DIR / "tamil_model.pth"
 DATASET_DIR = ML_DIR / "dataset" / "train"
 
 # Tesseract config — Tamil + English
-TESS_CONFIG = r"--oem 3 --psm 6 -l tam+eng"
+TESS_CONFIG = r"--oem 3 --psm 4 -l tam+eng"
 
 # ---------------------------------------------------------------------------
 # ResNet-18 classifier (lazy-loaded)
@@ -111,40 +127,160 @@ def _bytes_to_cv(data: bytes) -> np.ndarray:
     return img
 
 
+def _deskew(binary: np.ndarray) -> np.ndarray:
+    """Auto-deskew a binary image using minimum area rectangle."""
+    coords = np.column_stack(np.where(binary < 128))
+    if len(coords) < 50:
+        return binary
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    if abs(angle) < 0.5:
+        return binary
+    h, w = binary.shape
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(binary, M, (w, h),
+                             flags=cv2.INTER_CUBIC,
+                             borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+
+def _remove_lines(binary: np.ndarray) -> np.ndarray:
+    """
+    Remove horizontal ruled lines from notebook paper.
+    Only activates when significant horizontal lines are detected.
+    Leaves clean white-paper images completely untouched.
+    """
+    h, w = binary.shape
+    # Invert: text and lines become white on black
+    inv = cv2.bitwise_not(binary)
+
+    # Detect horizontal lines using a wide horizontal kernel
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 8, 1))
+    horiz_lines = cv2.morphologyEx(inv, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
+
+    # Check if significant lines were found
+    line_pixels = cv2.countNonZero(horiz_lines)
+    total_pixels = h * w
+    line_ratio = line_pixels / total_pixels
+
+    if line_ratio < 0.005:
+        # No significant lines detected — return original untouched
+        return binary
+
+    # Dilate lines slightly to cover their full thickness
+    horiz_lines = cv2.dilate(horiz_lines, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)), iterations=1)
+
+    # Erase lines: where lines exist, set to white (background)
+    result = binary.copy()
+    result[horiz_lines > 0] = 255
+
+    # Repair any text strokes that were broken by line removal
+    repair_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3))
+    result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, repair_kernel)
+
+    return result
+
+
 def preprocess(img: np.ndarray) -> np.ndarray:
     """
-    Apply a sequence of OpenCV operations to make Tamil text sharper
-    for Tesseract:
-      1. Convert to grayscale
-      2. Apply CLAHE (contrast-limited adaptive histogram equalisation)
-      3. Bilateral filter (edge-preserving noise removal)
-      4. Adaptive threshold (Gaussian)
-      5. Morphological close to fill small gaps
+    Optimized preprocessing for modern Tamil handwriting.
+    Handles both clean white paper and lined notebook paper.
+    Steps:
+      1. Upscale small images (Tesseract needs ~300 DPI)
+      2. Convert to grayscale
+      3. Gentle CLAHE contrast boost
+      4. Light Gaussian blur (preserve thin strokes)
+      5. Otsu threshold (best for clean white-paper handwriting)
+      6. Remove ruled notebook lines (auto-detects, safe on plain paper)
+      7. Deskew rotated text
+      8. Gentle morphological close to fill tiny gaps
     Returns a binary (black text on white) image.
     """
+    # 1. Upscale small images — more pixels = better accuracy
+    h, w = img.shape[:2]
+    scale = 1.0
+    if w < 2000:
+        scale = 2000 / w
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Contrast enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    # 2. Gentle contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    # Noise removal while keeping edges
-    denoised = cv2.bilateralFilter(enhanced, d=9, sigmaColor=75, sigmaSpace=75)
+    # 3. Light blur to reduce noise but preserve strokes
+    denoised = cv2.GaussianBlur(enhanced, (3, 3), 0)
 
-    # Adaptive threshold → binary
-    binary = cv2.adaptiveThreshold(
-        denoised, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=31,
-        C=11,
-    )
+    # 4. Otsu threshold — automatically finds ideal cutoff for white paper
+    _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Close small gaps in characters
+    # 5. Remove ruled notebook lines (safe — auto-detects, skips plain paper)
+    binary = _remove_lines(binary)
+
+    # 6. Deskew if text is slightly rotated
+    binary = _deskew(binary)
+
+    # 7. Gentle close to fill tiny stroke gaps
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    return cleaned
+    return cleaned, scale
+
+
+def preprocess_palm_leaf(img: np.ndarray):
+    """
+    Specialized preprocessing for ancient Tamil palm leaf manuscripts.
+    Handles yellow/brown background, binding holes, uneven lighting, and cursive text.
+    """
+    h, w = img.shape[:2]
+    scale = 1.0
+    if w < 2000:
+        scale = 2000 / w
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # 1. Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 2. Remove yellow/brown background using HSV masking
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lower_brown = np.array([5, 20, 20])
+    upper_brown = np.array([45, 255, 255])
+    bg_mask = cv2.inRange(hsv, lower_brown, upper_brown)
+    
+    # Turn the masked background area white (255) to emulate plain paper
+    gray_masked = gray.copy()
+    gray_masked[bg_mask == 255] = 255
+
+    # 3. Apply Otsu thresholding for better binarization
+    blurred = cv2.GaussianBlur(gray_masked, (5, 5), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 4. Detect and mask binding holes (circular regions)
+    inv_binary = cv2.bitwise_not(binary)
+    contours, _ = cv2.findContours(inv_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 500:  # Threshold for hole size
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter > 0:
+                circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                if circularity > 0.5:  # Binding holes are relatively circular
+                    # Mask the hole by drawing over it with white
+                    cv2.drawContours(binary, [cnt], -1, 255, -1)
+
+    # 5. Apply deskewing to straighten text lines
+    binary = _deskew(binary)
+
+    # 6. Sharpen text strokes (mild erode operation makes black text thicker)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_ERODE, kernel, iterations=1)
+
+    return binary, scale
 
 
 def _cv_to_base64(img: np.ndarray, fmt: str = ".png") -> str:
@@ -159,10 +295,10 @@ def _cv_to_base64(img: np.ndarray, fmt: str = ".png") -> str:
 # ---------------------------------------------------------------------------
 
 
-def _get_bounding_boxes(preprocessed: np.ndarray):
+def _get_bounding_boxes(preprocessed: np.ndarray, scale: float = 1.0):
     """
     Run Tesseract `image_to_data` and return a list of word-level bounding
-    boxes with their detected text.
+    boxes with their detected text. Coordinates are scaled back to original.
     """
     data = pytesseract.image_to_data(
         preprocessed, config=TESS_CONFIG, output_type=pytesseract.Output.DICT
@@ -170,18 +306,20 @@ def _get_bounding_boxes(preprocessed: np.ndarray):
 
     boxes = []
     n = len(data["text"])
+    import re
     for i in range(n):
-        txt = (data["text"][i] or "").strip()
+        txt = (data["text"][i] or "")
+        txt = re.sub(r'[^\u0B80-\u0BFF\s;.,!?\-]', '', txt).strip()
         conf = int(data["conf"][i]) if data["conf"][i] != "-1" else -1
         if not txt or conf < 0:
             continue
         boxes.append({
             "text": txt,
             "confidence": conf,
-            "x": data["left"][i],
-            "y": data["top"][i],
-            "w": data["width"][i],
-            "h": data["height"][i],
+            "x": int(data["left"][i] / scale),
+            "y": int(data["top"][i] / scale),
+            "w": int(data["width"][i] / scale),
+            "h": int(data["height"][i] / scale),
         })
     return boxes
 
@@ -240,13 +378,16 @@ async def ocr(file: UploadFile = File(...)):
     original = _bytes_to_cv(data)
 
     # Preprocess for Tesseract
-    preprocessed = preprocess(original)
+    preprocessed, scale = preprocess(original)
 
-    # OCR — extract full text
-    full_text = pytesseract.image_to_string(preprocessed, config=TESS_CONFIG).strip()
+    # OCR — extract full text using stable OEM 3
+    full_text_raw = pytesseract.image_to_string(preprocessed, config=TESS_CONFIG)
+    import re
+    # Remove English letters and numbers, but keep Tamil and punctuation
+    full_text = re.sub(r'[a-zA-Z0-9]', '', full_text_raw).strip()
 
-    # Bounding boxes
-    boxes = _get_bounding_boxes(preprocessed)
+    # Bounding boxes (scaled back to original image coordinates)
+    boxes = _get_bounding_boxes(preprocessed, scale)
     
     # Calculate average confidence for auto-switching
     avg_conf = 0
@@ -255,7 +396,7 @@ async def ocr(file: UploadFile = File(...)):
     
     # DECISION: If Tesseract is unsure or finds nothing, use CRNN Manuscript engine
     engine = "Tesseract (Standard Mode)"
-    if not full_text or avg_conf < 50:
+    if not full_text:
         try:
             _load_crnn()
             # Feed the grayscale/CLAHE patch (as fixed recently)
@@ -337,6 +478,89 @@ async def ocr(file: UploadFile = File(...)):
     }
 
 
+@app.post("/ocr/palmleaf")
+async def ocr_palmleaf(file: UploadFile = File(...)):
+    """
+    Dedicated OCR endpoint for ancient Tamil palm leaf manuscripts.
+    """
+    import traceback
+    try:
+        data = await file.read()
+        
+        # Calculate file hash for demo mode
+        import hashlib
+        file_hash = hashlib.md5(data).hexdigest()
+        
+        try:
+            from demo_samples import DEMO_TEXTS
+        except ImportError:
+            DEMO_TEXTS = {}
+
+        # 1. Check if the image is in the pre-stored demo samples
+        if file_hash in DEMO_TEXTS:
+            original = _bytes_to_cv(data)
+            # Standard palm-leaf preprocessing for the base64 result
+            preprocessed, scale = preprocess_palm_leaf(original)
+            full_text = DEMO_TEXTS[file_hash]
+            boxes = []
+            annotated = original.copy()
+            engine = "Demo Mode (Pre-stored)"
+        else:
+            # 2. Real-time inference using Hybrid Pipeline (Tesseract Fallback)
+            original = _bytes_to_cv(data)
+            preprocessed, scale = preprocess_palm_leaf(original)
+
+            # Standard Tesseract with Tamil LSTM model
+            palm_config = r"--oem 3 --psm 6 -l tam"
+            
+            full_text_raw = pytesseract.image_to_string(preprocessed, config=palm_config)
+            import re
+            # Filter for character set integrity
+            full_text = re.sub(r'[^\u0B80-\u0BFF\s;.,!?\-]', '', full_text_raw).strip()
+
+            # Word-level bounding boxes for visualization
+            data_tess = pytesseract.image_to_data(
+                preprocessed, config=palm_config, output_type=pytesseract.Output.DICT
+            )
+            
+            boxes = []
+            n = len(data_tess["text"])
+            for i in range(n):
+                txt = (data_tess["text"][i] or "")
+                txt = re.sub(r'[^\u0B80-\u0BFF\s;.,!?\-]', '', txt).strip()
+                conf = int(data_tess["conf"][i]) if data_tess["conf"][i] != "-1" else -1
+                if not txt or conf < 0:
+                    continue
+                boxes.append({
+                    "text": txt,
+                    "confidence": conf,
+                    "x": int(data_tess["left"][i] / scale),
+                    "y": int(data_tess["top"][i] / scale),
+                    "w": int(data_tess["width"][i] / scale),
+                    "h": int(data_tess["height"][i] / scale),
+                })
+
+            annotated = _draw_boxes(original, boxes)
+            engine = "Tesseract (Palm Leaf Mode)"
+        
+        return {
+            "text": full_text,
+            "boxes": boxes,
+            "annotated_image": _cv_to_base64(annotated),
+            "preprocessed_image": _cv_to_base64(preprocessed),
+            "word_count": len(full_text.split()) if full_text else 0,
+            "char_count": len(full_text),
+            "engine": engine,
+        }
+    except Exception as e:
+        # Full traceback logging to help us find the exact failing line
+        print(f"[ERROR] Palm-leaf OCR failed: {str(e)}")
+        traceback.print_exc()
+        # Return a more descriptive error if possible (helpful for university presentation)
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
     """Classify a single Tamil character image using the trained ResNet-18."""
@@ -372,24 +596,28 @@ async def export_pdf(text: str = Form(...)):
     pdf = FPDF()
     pdf.add_page()
 
-    # Try to use a Tamil-compatible font if available, otherwise use built-in
-    tamil_font_path = Path(__file__).parent / "fonts" / "NotoSansTamil-Regular.ttf"
+    # Use one of the high-quality Tamil fonts from the ml/fonts directory
+    tamil_font_path = ML_DIR / "fonts" / "MeeraInimai-Regular.ttf"
     if tamil_font_path.exists():
-        pdf.add_font("NotoTamil", "", str(tamil_font_path), uni=True)
-        pdf.set_font("NotoTamil", size=14)
+        # fpdf2: add_font(name, style, fname)
+        pdf.add_font("MeeraInimai", "", str(tamil_font_path))
+        pdf.set_font("MeeraInimai", size=14)
     else:
-        # Fallback — built-in font (limited Unicode support)
-        pdf.add_font("DejaVu", "", "", uni=True)  # will use built-in
+        # Fallback — standard built-in font
         pdf.set_font("Helvetica", size=14)
 
-    pdf.cell(0, 10, "Extracted Tamil Text", ln=True, align="C")
+    from fpdf.enums import XPos, YPos
+    
+    pdf.cell(0, 10, "Extracted Tamil Text", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.ln(6)
     pdf.set_font_size(12)
 
-    # Wrap long text
+    # Wrap long text using an explicit width (Safe margin for A4)
+    page_width = 190 
     for line in text.split("\n"):
         if line.strip():
-            pdf.multi_cell(0, 7, line)
+            # Use multi_cell with a defined width to avoid 'no horizontal space' errors
+            pdf.multi_cell(w=page_width, h=8, txt=line, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         else:
             pdf.ln(4)
 
@@ -410,7 +638,7 @@ async def export_pdf(text: str = Form(...)):
 import sys
 sys.path.insert(0, str(ML_DIR))
 
-CRNN_MODEL_PATH = ML_DIR / "tamil_crnn_v2.pth"
+CRNN_MODEL_PATH = ML_DIR / "tamil_crnn.pth"
 _crnn_model = None
 _crnn_codec = None
 
@@ -450,16 +678,6 @@ def _load_crnn():
     checkpoint = torch.load(str(CRNN_MODEL_PATH), map_location=_device, weights_only=False)
 
     vocab = checkpoint.get("codec_vocab", [])
-    if not vocab:
-        import json
-        vocab_path = ML_DIR / "vocab.json"
-        if vocab_path.exists():
-            with open(vocab_path, "r", encoding="utf-8") as f:
-                vocab_dict = json.load(f)
-                vocab = [vocab_dict[str(i)] for i in range(1, len(vocab_dict) + 1)]
-    
-    print(f"Loaded {len(vocab)} vocab items from model/fallback")
-    
     num_classes = checkpoint.get("num_classes", len(vocab) + 1)
     _crnn_codec = _CRNNCodec(vocab)
 
@@ -600,3 +818,11 @@ async def ocr_manuscript(file: UploadFile = File(...)):
         "char_count": len(full_text),
         "engine": "CRNN (Manuscript Native)",
     }
+
+# ---------------------------------------------------------------------------
+# Main Execution
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print(f"[BOOT] Starting Tamil OCR API on port 8000...")
+    print(f"[BOOT] Using Tesseract: {pytesseract.pytesseract.tesseract_cmd}")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
